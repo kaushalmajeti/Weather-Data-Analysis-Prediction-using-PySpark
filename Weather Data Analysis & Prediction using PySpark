@@ -1,0 +1,830 @@
+"""
+Production-Ready PySpark Pipeline for Air Quality and Weather Data Analysis
+---------------------------------------------------------------------------
+Dataset: AQI_with_weather_AQIlevel.csv
+Author: Kaushal
+Project: Big Data - Air Quality & Weather Analysis
+Key Features:
+    ✅ No data leakage between tasks
+    ✅ Efficient preprocessing (Imputer + StandardScaler)
+    ✅ Compact TrainValidationSplit (faster than CrossValidator)
+    ✅ Multiple models: RF, GBT, LR, RF-Classifier
+    ✅ Clean HDFS model saving
+    ✅ Handles missing data safely
+    ✅ Comprehensive visualizations
+    ✅ Fully commented for clarity
+"""
+
+import time
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
+import numpy as np
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, round, when
+from pyspark.sql.types import DoubleType
+from pyspark.ml.feature import VectorAssembler, StandardScaler, StringIndexer, Imputer
+from pyspark.ml.regression import LinearRegression, RandomForestRegressor, GBTRegressor
+from pyspark.ml.classification import RandomForestClassifier
+from pyspark.ml.evaluation import RegressionEvaluator, MulticlassClassificationEvaluator
+from pyspark.ml import Pipeline
+from pyspark.ml.tuning import ParamGridBuilder, TrainValidationSplit
+
+# Set visualization style
+sns.set_style("whitegrid")
+plt.rcParams['figure.figsize'] = (12, 8)
+plt.rcParams['font.size'] = 10
+
+# ----------------------------------------------------------------------------
+# 1️⃣  INITIALIZE SPARK SESSION
+# ----------------------------------------------------------------------------
+spark = SparkSession.builder \
+    .appName("AQI_Weather_Analysis_Final") \
+    .config("spark.sql.adaptive.enabled", "true") \
+    .config("spark.sql.adaptive.coalescePartitions.enabled", "true") \
+    .getOrCreate()
+
+print("="*80)
+print("✅ Spark Session Created Successfully!")
+print(f"🔹 Spark Version: {spark.version}")
+print("="*80)
+
+start_time = time.time()
+
+try:
+    # ----------------------------------------------------------------------------
+    # 2️⃣  LOAD DATA FROM HDFS
+    # ----------------------------------------------------------------------------
+    hdfs_path = "hdfs:///user/kaushal/datasets/AQI_with_weather_AQIlevel.csv"
+
+    df = spark.read.option("header", True).option("inferSchema", True).csv(hdfs_path)
+    print("\n✅ Dataset Loaded Successfully!")
+    print(f"Total Columns: {len(df.columns)}")
+    df.printSchema()
+    df.show(5)
+
+    # ----------------------------------------------------------------------------
+    # 3️⃣  DATA CLEANING & FEATURE CREATION
+    # ----------------------------------------------------------------------------
+    print("\n🧹 Cleaning Data ...")
+
+    # Remove duplicates
+    df_clean = df.dropDuplicates()
+
+    # Rename key columns for easier handling
+    rename_map = {
+        'temperature_C': 'temperature',
+        'humidity_%': 'humidity',
+        'pollutant_id': 'pollutant'
+    }
+    for old, new in rename_map.items():
+        if old in df_clean.columns:
+            df_clean = df_clean.withColumnRenamed(old, new)
+
+    # Cast numeric columns properly
+    numeric_cols = [c for c in ['pollutant_min', 'pollutant_max', 'pollutant_avg',
+                                'temperature', 'humidity', 'latitude', 'longitude']
+                    if c in df_clean.columns]
+    for c in numeric_cols:
+        df_clean = df_clean.withColumn(c, col(c).cast(DoubleType()))
+
+    # Drop rows missing key features
+    critical_cols = [c for c in ['latitude', 'longitude', 'temperature', 'humidity', 'AQI_Category']
+                     if c in df_clean.columns]
+    df_clean = df_clean.dropna(subset=critical_cols)
+
+    # Derived columns — safe feature engineering
+    df_clean = df_clean.withColumn('temp_humidity_ratio',
+                                   when(col('humidity') > 0, col('temperature') / col('humidity')).otherwise(0))
+    df_clean = df_clean.withColumn('pollutant_range', col('pollutant_max') - col('pollutant_min'))
+    df_clean = df_clean.withColumn('pollutant_volatility',
+                                   when(col('pollutant_avg') > 0, col('pollutant_range') / col('pollutant_avg')).otherwise(0))
+    df_clean = df_clean.withColumn('lat_rounded', round(col('latitude'), 2))
+    df_clean = df_clean.withColumn('lon_rounded', round(col('longitude'), 2))
+
+    print("✅ Data Cleaning Complete!")
+    df_clean.select("latitude", "longitude", "temperature", "humidity", "pollutant_avg", "AQI_Category").show(5)
+
+    # ----------------------------------------------------------------------------
+    # 📊 EXPLORATORY DATA ANALYSIS VISUALIZATIONS
+    # ----------------------------------------------------------------------------
+    print("\n📊 Creating EDA Visualizations...")
+    
+    # Convert sample to pandas for visualization
+    sample_df = df_clean.sample(fraction=0.1, seed=42).toPandas()
+    
+    # 1. Distribution plots for key variables
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    fig.suptitle('Distribution of Key Variables', fontsize=16, fontweight='bold')
+    
+    vars_to_plot = ['temperature', 'humidity', 'pollutant_avg', 'pollutant_min', 'pollutant_max', 'pollutant_range']
+    for idx, var in enumerate(vars_to_plot):
+        if var in sample_df.columns:
+            ax = axes[idx // 3, idx % 3]
+            sample_df[var].hist(bins=50, ax=ax, color='skyblue', edgecolor='black')
+            ax.set_title(f'Distribution of {var}', fontweight='bold')
+            ax.set_xlabel(var)
+            ax.set_ylabel('Frequency')
+    
+    plt.tight_layout()
+    plt.savefig('eda_distributions.png', dpi=300, bbox_inches='tight')
+    print("✅ Saved: eda_distributions.png")
+    plt.close()
+    
+    # 2. Correlation heatmap
+    numeric_cols_viz = ['temperature', 'humidity', 'pollutant_avg', 'pollutant_min', 'pollutant_max', 'latitude', 'longitude']
+    available_cols = [c for c in numeric_cols_viz if c in sample_df.columns]
+    
+    plt.figure(figsize=(12, 10))
+    correlation_matrix = sample_df[available_cols].corr()
+    sns.heatmap(correlation_matrix, annot=True, cmap='coolwarm', center=0, 
+                square=True, linewidths=1, cbar_kws={"shrink": 0.8})
+    plt.title('Correlation Matrix of Features', fontsize=16, fontweight='bold', pad=20)
+    plt.tight_layout()
+    plt.savefig('correlation_heatmap.png', dpi=300, bbox_inches='tight')
+    print("✅ Saved: correlation_heatmap.png")
+    plt.close()
+    
+    # 3. AQI Category Distribution
+    if 'AQI_Category' in sample_df.columns:
+        plt.figure(figsize=(12, 6))
+        aqi_counts = sample_df['AQI_Category'].value_counts()
+        aqi_counts.plot(kind='bar', color='coral', edgecolor='black')
+        plt.title('Distribution of AQI Categories', fontsize=16, fontweight='bold')
+        plt.xlabel('AQI Category')
+        plt.ylabel('Count')
+        plt.xticks(rotation=45, ha='right')
+        plt.tight_layout()
+        plt.savefig('aqi_distribution.png', dpi=300, bbox_inches='tight')
+        print("✅ Saved: aqi_distribution.png")
+        plt.close()
+
+    # ----------------------------------------------------------------------------
+    # 4️⃣  DEFINE FEATURE SETS FOR EACH ML TASK
+    # ----------------------------------------------------------------------------
+    print("\n⚙ Preparing feature sets...")
+
+    temp_features = ['latitude', 'longitude', 'humidity', 'pollutant_avg',
+                     'pollutant_min', 'pollutant_max', 'pollutant_range']
+    humidity_features = ['latitude', 'longitude', 'temperature', 'pollutant_avg',
+                         'pollutant_min', 'pollutant_max', 'pollutant_range']
+    pollutant_features = ['latitude', 'longitude', 'temperature', 'humidity',
+                          'temp_humidity_ratio', 'lat_rounded', 'lon_rounded']
+    aqi_features = ['latitude', 'longitude', 'temperature', 'humidity',
+                    'pollutant_min', 'pollutant_max', 'pollutant_avg',
+                    'temp_humidity_ratio', 'pollutant_range', 'pollutant_volatility']
+
+    # Drop NAs per task
+    df_temp = df_clean.select(temp_features + ['temperature']).dropna()
+    df_humidity = df_clean.select(humidity_features + ['humidity']).dropna()
+    df_pollutant = df_clean.select(pollutant_features + ['pollutant_avg']).dropna()
+    df_aqi = df_clean.select(aqi_features + ['AQI_Category']).dropna()
+
+    print("✅ Feature preparation complete!")
+
+    # ----------------------------------------------------------------------------
+    # 5️⃣  TRAIN-TEST SPLIT
+    # ----------------------------------------------------------------------------
+    print("\n📊 Splitting data into training and testing sets...")
+    train_temp, test_temp = df_temp.randomSplit([0.8, 0.2], seed=42)
+    train_humidity, test_humidity = df_humidity.randomSplit([0.8, 0.2], seed=42)
+    train_pollutant, test_pollutant = df_pollutant.randomSplit([0.8, 0.2], seed=42)
+    train_aqi, test_aqi = df_aqi.randomSplit([0.8, 0.2], seed=42)
+
+    # ----------------------------------------------------------------------------
+    # 6️⃣  HELPER FUNCTIONS FOR TRAINING
+    # ----------------------------------------------------------------------------
+    def train_regression(train_df, test_df, features, label, model, param_grid):
+        """Train and evaluate a regression model with TrainValidationSplit."""
+        imputer = Imputer(inputCols=features, outputCols=features, strategy="median")
+        assembler = VectorAssembler(inputCols=features, outputCol="features_raw")
+        scaler = StandardScaler(inputCol="features_raw", outputCol="features", withStd=True, withMean=False)
+        pipeline = Pipeline(stages=[imputer, assembler, scaler, model])
+        evaluator = RegressionEvaluator(labelCol=label, predictionCol="prediction", metricName="rmse")
+
+        tvs = TrainValidationSplit(estimator=pipeline,
+                                   estimatorParamMaps=param_grid,
+                                   evaluator=evaluator,
+                                   trainRatio=0.8)
+        tvs_model = tvs.fit(train_df)
+        preds = tvs_model.transform(test_df)
+
+        metrics = {
+            "RMSE": evaluator.evaluate(preds, {evaluator.metricName: "rmse"}),
+            "R2": RegressionEvaluator(labelCol=label, predictionCol="prediction", metricName="r2").evaluate(preds),
+            "MAE": RegressionEvaluator(labelCol=label, predictionCol="prediction", metricName="mae").evaluate(preds)
+        }
+        return tvs_model.bestModel, preds, metrics
+
+    def train_classifier(train_df, test_df, features, estimator, param_grid):
+        """Train and evaluate a classification model."""
+        indexer = StringIndexer(inputCol="AQI_Category", outputCol="label", handleInvalid="keep")
+        imputer = Imputer(inputCols=features, outputCols=features, strategy="median")
+        assembler = VectorAssembler(inputCols=features, outputCol="features_raw")
+        scaler = StandardScaler(inputCol="features_raw", outputCol="features", withStd=True, withMean=False)
+        pipeline = Pipeline(stages=[indexer, imputer, assembler, scaler, estimator])
+        evaluator = MulticlassClassificationEvaluator(labelCol="label", predictionCol="prediction", metricName="accuracy")
+
+        tvs = TrainValidationSplit(estimator=pipeline,
+                                   estimatorParamMaps=param_grid,
+                                   evaluator=evaluator,
+                                   trainRatio=0.8)
+        tvs_model = tvs.fit(train_df)
+        preds = tvs_model.transform(test_df)
+
+        metrics = {
+            "Accuracy": evaluator.evaluate(preds),
+            "F1": MulticlassClassificationEvaluator(labelCol="label", predictionCol="prediction", metricName="f1").evaluate(preds),
+            "Precision": MulticlassClassificationEvaluator(labelCol="label", predictionCol="prediction", metricName="weightedPrecision").evaluate(preds),
+            "Recall": MulticlassClassificationEvaluator(labelCol="label", predictionCol="prediction", metricName="weightedRecall").evaluate(preds)
+        }
+        return tvs_model.bestModel, preds, metrics
+
+    # ----------------------------------------------------------------------------
+    # 7️⃣  TRAIN MODELS FOR EACH TASK
+    # ----------------------------------------------------------------------------
+    print("\n🚀 Training models...")
+
+    # (a) Temperature - Random Forest
+    rf_temp = RandomForestRegressor(featuresCol="features", labelCol="temperature", seed=42)
+    temp_grid = ParamGridBuilder().addGrid(rf_temp.numTrees, [50]).addGrid(rf_temp.maxDepth, [5]).build()
+    temp_model, temp_preds, temp_metrics = train_regression(train_temp, test_temp, temp_features, "temperature", rf_temp, temp_grid)
+    print("\n🌡 Temperature Model Metrics:", temp_metrics)
+
+    # (b) Humidity - Gradient Boosted Trees
+    gbt_humidity = GBTRegressor(featuresCol="features", labelCol="humidity", seed=42)
+    hum_grid = ParamGridBuilder().addGrid(gbt_humidity.maxIter, [30]).addGrid(gbt_humidity.maxDepth, [5]).build()
+    hum_model, hum_preds, hum_metrics = train_regression(train_humidity, test_humidity, humidity_features, "humidity", gbt_humidity, hum_grid)
+    print("\n💧 Humidity Model Metrics:", hum_metrics)
+
+    # (c) Pollutant Average - Linear Regression
+    lr_pollutant = LinearRegression(featuresCol="features", labelCol="pollutant_avg", maxIter=50)
+    pol_grid = ParamGridBuilder().addGrid(lr_pollutant.regParam, [0.01]).addGrid(lr_pollutant.elasticNetParam, [0.0]).build()
+    pol_model, pol_preds, pol_metrics = train_regression(train_pollutant, test_pollutant, pollutant_features, "pollutant_avg", lr_pollutant, pol_grid)
+    print("\n☁ Pollutant Model Metrics:", pol_metrics)
+
+    # (d) AQI Category - Random Forest Classifier
+    rf_aqi = RandomForestClassifier(featuresCol="features", labelCol="label", seed=42)
+    aqi_grid = ParamGridBuilder().addGrid(rf_aqi.numTrees, [50]).addGrid(rf_aqi.maxDepth, [5]).build()
+    aqi_model, aqi_preds, aqi_metrics = train_classifier(train_aqi, test_aqi, aqi_features, rf_aqi, aqi_grid)
+    print("\n🌍 AQI Category Model Metrics:", aqi_metrics)
+
+    # ----------------------------------------------------------------------------
+    # 📊 VISUALIZATION FUNCTIONS
+    # ----------------------------------------------------------------------------
+    def plot_regression_results(preds_df, actual_col, title, filename):
+        """Create comprehensive regression visualization."""
+        # Sample predictions for visualization
+        pred_sample = preds_df.select(actual_col, "prediction").sample(fraction=0.3, seed=42).toPandas()
+        
+        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+        fig.suptitle(title, fontsize=18, fontweight='bold', y=1.00)
+        
+        # 1. Actual vs Predicted Scatter
+        axes[0, 0].scatter(pred_sample[actual_col], pred_sample['prediction'], 
+                          alpha=0.5, c='dodgerblue', edgecolors='black', s=30)
+        min_val = min(pred_sample[actual_col].min(), pred_sample['prediction'].min())
+        max_val = max(pred_sample[actual_col].max(), pred_sample['prediction'].max())
+        axes[0, 0].plot([min_val, max_val], [min_val, max_val], 'r--', lw=2, label='Perfect Prediction')
+        axes[0, 0].set_xlabel(f'Actual {actual_col}', fontweight='bold')
+        axes[0, 0].set_ylabel('Predicted', fontweight='bold')
+        axes[0, 0].set_title('Actual vs Predicted Values', fontweight='bold')
+        axes[0, 0].legend()
+        axes[0, 0].grid(True, alpha=0.3)
+        
+        # 2. Residuals Plot
+        residuals = pred_sample['prediction'] - pred_sample[actual_col]
+        axes[0, 1].scatter(pred_sample['prediction'], residuals, 
+                          alpha=0.5, c='coral', edgecolors='black', s=30)
+        axes[0, 1].axhline(y=0, color='r', linestyle='--', lw=2)
+        axes[0, 1].set_xlabel('Predicted Values', fontweight='bold')
+        axes[0, 1].set_ylabel('Residuals', fontweight='bold')
+        axes[0, 1].set_title('Residual Plot', fontweight='bold')
+        axes[0, 1].grid(True, alpha=0.3)
+        
+        # 3. Distribution of Residuals
+        axes[1, 0].hist(residuals, bins=50, color='lightgreen', edgecolor='black')
+        axes[1, 0].axvline(x=0, color='r', linestyle='--', lw=2)
+        axes[1, 0].set_xlabel('Residuals', fontweight='bold')
+        axes[1, 0].set_ylabel('Frequency', fontweight='bold')
+        axes[1, 0].set_title('Distribution of Residuals', fontweight='bold')
+        axes[1, 0].grid(True, alpha=0.3)
+        
+        # 4. Q-Q Plot
+        from scipy import stats
+        stats.probplot(residuals, dist="norm", plot=axes[1, 1])
+        axes[1, 1].set_title('Q-Q Plot', fontweight='bold')
+        axes[1, 1].grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.savefig(filename, dpi=300, bbox_inches='tight')
+        print(f"✅ Saved: {filename}")
+        plt.close()
+    
+    def plot_classification_results(preds_df, title, filename):
+        """Create comprehensive classification visualization."""
+        # Get predictions with labels
+        pred_sample = preds_df.select("label", "prediction", "AQI_Category").toPandas()
+        
+        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+        fig.suptitle(title, fontsize=18, fontweight='bold', y=1.00)
+        
+        # 1. Confusion Matrix
+        from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
+        cm = confusion_matrix(pred_sample['label'], pred_sample['prediction'])
+        disp = ConfusionMatrixDisplay(confusion_matrix=cm)
+        disp.plot(ax=axes[0, 0], cmap='Blues', colorbar=True)
+        axes[0, 0].set_title('Confusion Matrix', fontweight='bold')
+        
+        # 2. Class Distribution - Actual vs Predicted
+        class_actual = pred_sample['label'].value_counts().sort_index()
+        class_predicted = pred_sample['prediction'].value_counts().sort_index()
+        
+        # Get all unique classes from both actual and predicted
+        all_classes = sorted(set(class_actual.index) | set(class_predicted.index))
+        
+        # Reindex to ensure both have the same classes (fill missing with 0)
+        class_actual = class_actual.reindex(all_classes, fill_value=0)
+        class_predicted = class_predicted.reindex(all_classes, fill_value=0)
+        
+        x = np.arange(len(all_classes))
+        width = 0.35
+        axes[0, 1].bar(x - width/2, class_actual.values, width, label='Actual', color='skyblue', edgecolor='black')
+        axes[0, 1].bar(x + width/2, class_predicted.values, width, label='Predicted', color='coral', edgecolor='black')
+        axes[0, 1].set_xlabel('Class Label', fontweight='bold')
+        axes[0, 1].set_ylabel('Count', fontweight='bold')
+        axes[0, 1].set_title('Class Distribution: Actual vs Predicted', fontweight='bold')
+        axes[0, 1].set_xticks(x)
+        axes[0, 1].set_xticklabels(all_classes)
+        axes[0, 1].legend()
+        axes[0, 1].grid(True, alpha=0.3, axis='y')
+        
+        # 3. Prediction Accuracy by Class
+        accuracy_by_class = []
+        for label in sorted(pred_sample['label'].unique()):
+            class_data = pred_sample[pred_sample['label'] == label]
+            accuracy = (class_data['label'] == class_data['prediction']).mean()
+            accuracy_by_class.append(accuracy)
+        
+        axes[1, 0].bar(range(len(accuracy_by_class)), accuracy_by_class, 
+                      color='lightgreen', edgecolor='black')
+        axes[1, 0].set_xlabel('Class Label', fontweight='bold')
+        axes[1, 0].set_ylabel('Accuracy', fontweight='bold')
+        axes[1, 0].set_title('Prediction Accuracy by Class', fontweight='bold')
+        axes[1, 0].set_ylim([0, 1])
+        axes[1, 0].grid(True, alpha=0.3, axis='y')
+        
+        # 4. AQI Category Distribution
+        aqi_dist = pred_sample['AQI_Category'].value_counts()
+        axes[1, 1].pie(aqi_dist.values, labels=aqi_dist.index, autopct='%1.1f%%',
+                      startangle=90, colors=plt.cm.Set3.colors)
+        axes[1, 1].set_title('AQI Category Distribution in Test Set', fontweight='bold')
+        
+        plt.tight_layout()
+        plt.savefig(filename, dpi=300, bbox_inches='tight')
+        print(f"✅ Saved: {filename}")
+        plt.close()
+
+    # ----------------------------------------------------------------------------
+    # 📊 CREATE VISUALIZATIONS FOR EACH MODEL
+    # ----------------------------------------------------------------------------
+    print("\n📊 Creating model visualizations...")
+    
+    # Temperature Model
+    plot_regression_results(temp_preds, "temperature", 
+                           "Temperature Prediction - Random Forest Model",
+                           "temperature_model_analysis.png")
+    
+    # Humidity Model
+    plot_regression_results(hum_preds, "humidity",
+                           "Humidity Prediction - Gradient Boosted Trees Model",
+                           "humidity_model_analysis.png")
+    
+    # Pollutant Model
+    plot_regression_results(pol_preds, "pollutant_avg",
+                           "Pollutant Average Prediction - Linear Regression Model",
+                           "pollutant_model_analysis.png")
+    
+    # AQI Classification Model
+    plot_classification_results(aqi_preds,
+                               "AQI Category Classification - Random Forest Model",
+                               "aqi_classification_analysis.png")
+
+    # ----------------------------------------------------------------------------
+    # 📊 MODEL COMPARISON VISUALIZATIONS
+    # ----------------------------------------------------------------------------
+    print("\n📊 Creating model comparison visualizations...")
+    
+    # 1. Metrics Comparison for Regression Models
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    fig.suptitle('Regression Models Performance Comparison', fontsize=16, fontweight='bold')
+    
+    models = ['Temp RF', 'Humidity GBT', 'Pollutant LR']
+    metrics_dict = {
+        'RMSE': [temp_metrics['RMSE'], hum_metrics['RMSE'], pol_metrics['RMSE']],
+        'R²': [temp_metrics['R2'], hum_metrics['R2'], pol_metrics['R2']],
+        'MAE': [temp_metrics['MAE'], hum_metrics['MAE'], pol_metrics['MAE']]
+    }
+    
+    colors = ['skyblue', 'lightcoral', 'lightgreen']
+    
+    for idx, (metric_name, values) in enumerate(metrics_dict.items()):
+        axes[idx].bar(models, values, color=colors, edgecolor='black', linewidth=1.5)
+        axes[idx].set_title(f'{metric_name} Comparison', fontweight='bold')
+        axes[idx].set_ylabel(metric_name, fontweight='bold')
+        axes[idx].grid(True, alpha=0.3, axis='y')
+        
+        # Add value labels on bars
+        for i, v in enumerate(values):
+            axes[idx].text(i, v, f'{v:.4f}', ha='center', va='bottom', fontweight='bold')
+    
+    plt.tight_layout()
+    plt.savefig('regression_models_comparison.png', dpi=300, bbox_inches='tight')
+    print("✅ Saved: regression_models_comparison.png")
+    plt.close()
+    
+    # 2. Classification Model Metrics
+    fig, ax = plt.subplots(figsize=(10, 6))
+    
+    classification_metrics = ['Accuracy', 'F1', 'Precision', 'Recall']
+    classification_values = [aqi_metrics['Accuracy'], aqi_metrics['F1'], 
+                            aqi_metrics['Precision'], aqi_metrics['Recall']]
+    
+    bars = ax.bar(classification_metrics, classification_values, 
+                  color=['gold', 'lightblue', 'lightcoral', 'lightgreen'],
+                  edgecolor='black', linewidth=1.5)
+    ax.set_title('AQI Classification Model - Performance Metrics', 
+                fontsize=16, fontweight='bold')
+    ax.set_ylabel('Score', fontweight='bold')
+    ax.set_ylim([0, 1])
+    ax.grid(True, alpha=0.3, axis='y')
+    
+    # Add value labels
+    for bar, val in zip(bars, classification_values):
+        height = bar.get_height()
+        ax.text(bar.get_x() + bar.get_width()/2., height,
+               f'{val:.4f}', ha='center', va='bottom', fontweight='bold')
+    
+    plt.tight_layout()
+    plt.savefig('classification_metrics.png', dpi=300, bbox_inches='tight')
+    print("✅ Saved: classification_metrics.png")
+    plt.close()
+    
+    # 3. Overall Model Summary Dashboard
+    fig = plt.figure(figsize=(16, 10))
+    gs = fig.add_gridspec(3, 2, hspace=0.3, wspace=0.3)
+    
+    # Title
+    fig.suptitle('Complete Model Performance Dashboard', fontsize=20, fontweight='bold', y=0.98)
+    
+    # Regression RMSE
+    ax1 = fig.add_subplot(gs[0, 0])
+    ax1.bar(models, [temp_metrics['RMSE'], hum_metrics['RMSE'], pol_metrics['RMSE']], 
+           color=colors, edgecolor='black')
+    ax1.set_title('RMSE Comparison (Lower is Better)', fontweight='bold')
+    ax1.set_ylabel('RMSE')
+    ax1.grid(True, alpha=0.3, axis='y')
+    
+    # Regression R²
+    ax2 = fig.add_subplot(gs[0, 1])
+    ax2.bar(models, [temp_metrics['R2'], hum_metrics['R2'], pol_metrics['R2']], 
+           color=colors, edgecolor='black')
+    ax2.set_title('R² Score Comparison (Higher is Better)', fontweight='bold')
+    ax2.set_ylabel('R² Score')
+    ax2.set_ylim([0, 1])
+    ax2.grid(True, alpha=0.3, axis='y')
+    
+    # Classification Metrics
+    ax3 = fig.add_subplot(gs[1, :])
+    x_pos = np.arange(len(classification_metrics))
+    bars = ax3.bar(x_pos, classification_values, 
+                   color=['gold', 'lightblue', 'lightcoral', 'lightgreen'],
+                   edgecolor='black', width=0.6)
+    ax3.set_xticks(x_pos)
+    ax3.set_xticklabels(classification_metrics)
+    ax3.set_title('AQI Classification Metrics', fontweight='bold', fontsize=14)
+    ax3.set_ylabel('Score')
+    ax3.set_ylim([0, 1])
+    ax3.grid(True, alpha=0.3, axis='y')
+    for bar, val in zip(bars, classification_values):
+        ax3.text(bar.get_x() + bar.get_width()/2., bar.get_height(),
+                f'{val:.3f}', ha='center', va='bottom', fontweight='bold')
+    
+    # Model Summary Table
+    ax4 = fig.add_subplot(gs[2, :])
+    ax4.axis('tight')
+    ax4.axis('off')
+    
+    summary_data = [
+        ['Model', 'Task', 'Primary Metric', 'Score'],
+        ['Random Forest', 'Temperature', 'RMSE', f"{temp_metrics['RMSE']:.4f}"],
+        ['GBT', 'Humidity', 'RMSE', f"{hum_metrics['RMSE']:.4f}"],
+        ['Linear Reg', 'Pollutant', 'RMSE', f"{pol_metrics['RMSE']:.4f}"],
+        ['RF Classifier', 'AQI Category', 'Accuracy', f"{aqi_metrics['Accuracy']:.4f}"]
+    ]
+    
+    table = ax4.table(cellText=summary_data,
+                     cellLoc='center',
+                     loc='center',
+                     colWidths=[0.25, 0.25, 0.25, 0.25])
+    table.auto_set_font_size(False)
+    table.set_fontsize(11)
+    table.scale(1, 2)
+    
+    # Style header row
+    for i in range(4):
+        table[(0, i)].set_facecolor('#4CAF50')
+        table[(0, i)].set_text_props(weight='bold', color='white')
+    
+    # Alternate row colors
+    for i in range(1, 5):
+        for j in range(4):
+            if i % 2 == 0:
+                table[(i, j)].set_facecolor('#f0f0f0')
+    
+    ax4.set_title('Model Summary Table', fontweight='bold', fontsize=14, pad=20)
+    
+    plt.savefig('complete_model_dashboard.png', dpi=300, bbox_inches='tight')
+    print("✅ Saved: complete_model_dashboard.png")
+    plt.close()
+    
+    # 4. Feature Importance Visualization (for tree-based models)
+    print("\n📊 Creating feature importance visualizations...")
+    
+    def extract_feature_importance(model_pipeline, feature_names, title, filename):
+        """Extract and plot feature importance from tree-based models."""
+        try:
+            # Navigate through pipeline to get the model
+            stages = model_pipeline.stages
+            model = None
+            for stage in stages:
+                if hasattr(stage, 'featureImportances'):
+                    model = stage
+                    break
+            
+            if model and hasattr(model, 'featureImportances'):
+                importances = model.featureImportances.toArray()
+                
+                # Create DataFrame
+                importance_df = pd.DataFrame({
+                    'Feature': feature_names,
+                    'Importance': importances
+                }).sort_values('Importance', ascending=False)
+                
+                # Plot
+                plt.figure(figsize=(12, 8))
+                colors_map = plt.cm.viridis(np.linspace(0, 1, len(importance_df)))
+                bars = plt.barh(importance_df['Feature'], importance_df['Importance'],
+                               color=colors_map, edgecolor='black')
+                plt.xlabel('Importance Score', fontweight='bold', fontsize=12)
+                plt.ylabel('Features', fontweight='bold', fontsize=12)
+                plt.title(title, fontweight='bold', fontsize=14)
+                plt.gca().invert_yaxis()
+                plt.grid(True, alpha=0.3, axis='x')
+                
+                # Add value labels
+                for i, (bar, val) in enumerate(zip(bars, importance_df['Importance'])):
+                    plt.text(val, bar.get_y() + bar.get_height()/2,
+                            f' {val:.4f}', va='center', fontweight='bold')
+                
+                plt.tight_layout()
+                plt.savefig(filename, dpi=300, bbox_inches='tight')
+                print(f"✅ Saved: {filename}")
+                plt.close()
+            else:
+                print(f"⚠️  Model doesn't support feature importance: {title}")
+        except Exception as e:
+            print(f"⚠️  Could not extract feature importance for {title}: {e}")
+    
+    # Extract feature importance for tree-based models
+    extract_feature_importance(temp_model, temp_features,
+                              'Feature Importance - Temperature RF Model',
+                              'temperature_feature_importance.png')
+    
+    extract_feature_importance(hum_model, humidity_features,
+                              'Feature Importance - Humidity GBT Model',
+                              'humidity_feature_importance.png')
+    
+    extract_feature_importance(aqi_model, aqi_features,
+                              'Feature Importance - AQI RF Classifier',
+                              'aqi_feature_importance.png')
+    
+    # 5. Prediction Distribution Comparison
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    fig.suptitle('Prediction Distribution Analysis', fontsize=18, fontweight='bold')
+    
+    # Temperature
+    temp_pdf = temp_preds.select("temperature", "prediction").sample(fraction=0.3, seed=42).toPandas()
+    axes[0, 0].hist([temp_pdf['temperature'], temp_pdf['prediction']], 
+                    bins=30, label=['Actual', 'Predicted'], 
+                    color=['skyblue', 'coral'], alpha=0.7, edgecolor='black')
+    axes[0, 0].set_xlabel('Temperature', fontweight='bold')
+    axes[0, 0].set_ylabel('Frequency', fontweight='bold')
+    axes[0, 0].set_title('Temperature: Actual vs Predicted Distribution', fontweight='bold')
+    axes[0, 0].legend()
+    axes[0, 0].grid(True, alpha=0.3)
+    
+    # Humidity
+    hum_pdf = hum_preds.select("humidity", "prediction").sample(fraction=0.3, seed=42).toPandas()
+    axes[0, 1].hist([hum_pdf['humidity'], hum_pdf['prediction']], 
+                    bins=30, label=['Actual', 'Predicted'],
+                    color=['lightgreen', 'orange'], alpha=0.7, edgecolor='black')
+    axes[0, 1].set_xlabel('Humidity', fontweight='bold')
+    axes[0, 1].set_ylabel('Frequency', fontweight='bold')
+    axes[0, 1].set_title('Humidity: Actual vs Predicted Distribution', fontweight='bold')
+    axes[0, 1].legend()
+    axes[0, 1].grid(True, alpha=0.3)
+    
+    # Pollutant
+    pol_pdf = pol_preds.select("pollutant_avg", "prediction").sample(fraction=0.3, seed=42).toPandas()
+    axes[1, 0].hist([pol_pdf['pollutant_avg'], pol_pdf['prediction']], 
+                    bins=30, label=['Actual', 'Predicted'],
+                    color=['gold', 'purple'], alpha=0.7, edgecolor='black')
+    axes[1, 0].set_xlabel('Pollutant Average', fontweight='bold')
+    axes[1, 0].set_ylabel('Frequency', fontweight='bold')
+    axes[1, 0].set_title('Pollutant: Actual vs Predicted Distribution', fontweight='bold')
+    axes[1, 0].legend()
+    axes[1, 0].grid(True, alpha=0.3)
+    
+    # AQI Prediction confidence
+    aqi_pdf = aqi_preds.select("label", "prediction").toPandas()
+    correct = (aqi_pdf['label'] == aqi_pdf['prediction']).sum()
+    incorrect = len(aqi_pdf) - correct
+    
+    axes[1, 1].pie([correct, incorrect], 
+                   labels=['Correct', 'Incorrect'],
+                   autopct='%1.1f%%',
+                   startangle=90,
+                   colors=['lightgreen', 'lightcoral'],
+                   explode=(0.05, 0))
+    axes[1, 1].set_title('AQI Classification Accuracy', fontweight='bold')
+    
+    plt.tight_layout()
+    plt.savefig('prediction_distributions.png', dpi=300, bbox_inches='tight')
+    print("✅ Saved: prediction_distributions.png")
+    plt.close()
+    
+    # 6. Error Analysis
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    fig.suptitle('Error Analysis Across Regression Models', fontsize=16, fontweight='bold')
+    
+    # Temperature errors
+    temp_errors = np.abs(temp_pdf['prediction'] - temp_pdf['temperature'])
+    axes[0].hist(temp_errors, bins=30, color='skyblue', edgecolor='black')
+    axes[0].axvline(temp_errors.mean(), color='red', linestyle='--', linewidth=2, label=f'Mean: {temp_errors.mean():.2f}')
+    axes[0].set_xlabel('Absolute Error', fontweight='bold')
+    axes[0].set_ylabel('Frequency', fontweight='bold')
+    axes[0].set_title('Temperature Prediction Errors', fontweight='bold')
+    axes[0].legend()
+    axes[0].grid(True, alpha=0.3)
+    
+    # Humidity errors
+    hum_errors = np.abs(hum_pdf['prediction'] - hum_pdf['humidity'])
+    axes[1].hist(hum_errors, bins=30, color='lightgreen', edgecolor='black')
+    axes[1].axvline(hum_errors.mean(), color='red', linestyle='--', linewidth=2, label=f'Mean: {hum_errors.mean():.2f}')
+    axes[1].set_xlabel('Absolute Error', fontweight='bold')
+    axes[1].set_ylabel('Frequency', fontweight='bold')
+    axes[1].set_title('Humidity Prediction Errors', fontweight='bold')
+    axes[1].legend()
+    axes[1].grid(True, alpha=0.3)
+    
+    # Pollutant errors
+    pol_errors = np.abs(pol_pdf['prediction'] - pol_pdf['pollutant_avg'])
+    axes[2].hist(pol_errors, bins=30, color='gold', edgecolor='black')
+    axes[2].axvline(pol_errors.mean(), color='red', linestyle='--', linewidth=2, label=f'Mean: {pol_errors.mean():.2f}')
+    axes[2].set_xlabel('Absolute Error', fontweight='bold')
+    axes[2].set_ylabel('Frequency', fontweight='bold')
+    axes[2].set_title('Pollutant Prediction Errors', fontweight='bold')
+    axes[2].legend()
+    axes[2].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig('error_analysis.png', dpi=300, bbox_inches='tight')
+    print("✅ Saved: error_analysis.png")
+    plt.close()
+    
+    # 7. Geographic Distribution of Predictions (if lat/lon available)
+    if 'latitude' in temp_pdf.columns and 'longitude' in temp_pdf.columns:
+        fig, axes = plt.subplots(2, 2, figsize=(16, 14))
+        fig.suptitle('Geographic Distribution of Predictions', fontsize=18, fontweight='bold')
+        
+        # Temperature predictions by location
+        scatter1 = axes[0, 0].scatter(temp_pdf['longitude'], temp_pdf['latitude'],
+                                     c=temp_pdf['prediction'], cmap='coolwarm',
+                                     s=50, alpha=0.6, edgecolors='black', linewidth=0.5)
+        axes[0, 0].set_xlabel('Longitude', fontweight='bold')
+        axes[0, 0].set_ylabel('Latitude', fontweight='bold')
+        axes[0, 0].set_title('Temperature Predictions by Location', fontweight='bold')
+        plt.colorbar(scatter1, ax=axes[0, 0], label='Temperature')
+        axes[0, 0].grid(True, alpha=0.3)
+        
+        # Humidity predictions by location
+        hum_pdf_geo = hum_preds.select("latitude", "longitude", "prediction").sample(fraction=0.3, seed=42).toPandas()
+        scatter2 = axes[0, 1].scatter(hum_pdf_geo['longitude'], hum_pdf_geo['latitude'],
+                                     c=hum_pdf_geo['prediction'], cmap='BuGn',
+                                     s=50, alpha=0.6, edgecolors='black', linewidth=0.5)
+        axes[0, 1].set_xlabel('Longitude', fontweight='bold')
+        axes[0, 1].set_ylabel('Latitude', fontweight='bold')
+        axes[0, 1].set_title('Humidity Predictions by Location', fontweight='bold')
+        plt.colorbar(scatter2, ax=axes[0, 1], label='Humidity')
+        axes[0, 1].grid(True, alpha=0.3)
+        
+        # Pollutant predictions by location
+        pol_pdf_geo = pol_preds.select("latitude", "longitude", "prediction").sample(fraction=0.3, seed=42).toPandas()
+        scatter3 = axes[1, 0].scatter(pol_pdf_geo['longitude'], pol_pdf_geo['latitude'],
+                                     c=pol_pdf_geo['prediction'], cmap='YlOrRd',
+                                     s=50, alpha=0.6, edgecolors='black', linewidth=0.5)
+        axes[1, 0].set_xlabel('Longitude', fontweight='bold')
+        axes[1, 0].set_ylabel('Latitude', fontweight='bold')
+        axes[1, 0].set_title('Pollutant Predictions by Location', fontweight='bold')
+        plt.colorbar(scatter3, ax=axes[1, 0], label='Pollutant Avg')
+        axes[1, 0].grid(True, alpha=0.3)
+        
+        # AQI predictions by location
+        aqi_pdf_geo = aqi_preds.select("latitude", "longitude", "prediction").sample(fraction=0.3, seed=42).toPandas()
+        scatter4 = axes[1, 1].scatter(aqi_pdf_geo['longitude'], aqi_pdf_geo['latitude'],
+                                     c=aqi_pdf_geo['prediction'], cmap='viridis',
+                                     s=50, alpha=0.6, edgecolors='black', linewidth=0.5)
+        axes[1, 1].set_xlabel('Longitude', fontweight='bold')
+        axes[1, 1].set_ylabel('Latitude', fontweight='bold')
+        axes[1, 1].set_title('AQI Category Predictions by Location', fontweight='bold')
+        plt.colorbar(scatter4, ax=axes[1, 1], label='AQI Class')
+        axes[1, 1].grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.savefig('geographic_predictions.png', dpi=300, bbox_inches='tight')
+        print("✅ Saved: geographic_predictions.png")
+        plt.close()
+
+    # ----------------------------------------------------------------------------
+    # 8️⃣  SAVE TRAINED MODELS TO HDFS
+    # ----------------------------------------------------------------------------
+    print("\n💾 Saving trained models to HDFS ...")
+    model_path = "hdfs:///user/kaushal/models/"
+    temp_model.write().overwrite().save(model_path + "temperature_rf_final")
+    hum_model.write().overwrite().save(model_path + "humidity_gbt_final")
+    pol_model.write().overwrite().save(model_path + "pollutant_lr_final")
+    aqi_model.write().overwrite().save(model_path + "aqi_rf_final")
+    print("✅ All models saved successfully at:", model_path)
+
+    # ----------------------------------------------------------------------------
+    # 9️⃣  FORECASTING EXAMPLES
+    # ----------------------------------------------------------------------------
+    print("\n🔮 Forecasting samples:")
+    temp_preds.select("latitude", "longitude", "temperature", "prediction").show(5)
+    hum_preds.select("latitude", "longitude", "humidity", "prediction").show(5)
+    pol_preds.select("latitude", "longitude", "pollutant_avg", "prediction").show(5)
+    aqi_preds.select("AQI_Category", "prediction", "probability").show(5, truncate=False)
+
+    # ----------------------------------------------------------------------------
+    # 🔟  SUMMARY
+    # ----------------------------------------------------------------------------
+    print("\n" + "="*80)
+    print("✅ FINAL MODEL PERFORMANCE SUMMARY")
+    print("="*80)
+    print(f"Temperature RF  ➜  RMSE={temp_metrics['RMSE']:.4f}, R²={temp_metrics['R2']:.4f}, MAE={temp_metrics['MAE']:.4f}")
+    print(f"Humidity GBT     ➜  RMSE={hum_metrics['RMSE']:.4f}, R²={hum_metrics['R2']:.4f}, MAE={hum_metrics['MAE']:.4f}")
+    print(f"Pollutant LR     ➜  RMSE={pol_metrics['RMSE']:.4f}, R²={pol_metrics['R2']:.4f}, MAE={pol_metrics['MAE']:.4f}")
+    print(f"AQI RF Classifier➜  Accuracy={aqi_metrics['Accuracy']:.4f}, F1={aqi_metrics['F1']:.4f}")
+    print("="*80)
+    
+    print("\n📊 VISUALIZATIONS GENERATED:")
+    print("="*80)
+    viz_files = [
+        "eda_distributions.png",
+        "correlation_heatmap.png",
+        "aqi_distribution.png",
+        "temperature_model_analysis.png",
+        "humidity_model_analysis.png",
+        "pollutant_model_analysis.png",
+        "aqi_classification_analysis.png",
+        "regression_models_comparison.png",
+        "classification_metrics.png",
+        "complete_model_dashboard.png",
+        "temperature_feature_importance.png",
+        "humidity_feature_importance.png",
+        "aqi_feature_importance.png",
+        "prediction_distributions.png",
+        "error_analysis.png",
+        "geographic_predictions.png"
+    ]
+    
+    for i, viz in enumerate(viz_files, 1):
+        print(f"{i:2d}. {viz}")
+    print("="*80)
+
+    # ----------------------------------------------------------------------------
+    # 🔚 CLEANUP
+    # ----------------------------------------------------------------------------
+    df_clean.unpersist()
+    print(f"\n✨ Completed Successfully in {time.time() - start_time:.1f} seconds.")
+    print("✅ Models ready for deployment!")
+    print("📊 All visualizations saved to current directory!")
+
+except Exception as e:
+    print("❌ ERROR OCCURRED:", e)
+    import traceback
+    traceback.print_exc()
+finally:
+    spark.stop()
+    print("🛑 Spark Session Stopped.")
